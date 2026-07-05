@@ -2,12 +2,15 @@
 Multi-method Columbia alumni finder.
 
 Priority chain per company:
-  1. Apollo.io  — people search with school filter
-                  (best: name + title + email + LinkedIn)
-  2. SerpAPI    — Google search via serpapi.com (site:linkedin.com/in)
-                  (free 100 searches/month; needs SERPAPI_KEY)
-  3. Hunter.io  — domain email enrichment for step-2 hits
-                  (free 25 searches/month; needs HUNTER_API_KEY)
+  1. Apollo.io    — people search with school filter
+                    (best: name + title + email + LinkedIn)
+  2. SerpAPI      — Google search via serpapi.com (site:linkedin.com/in)
+                    (free 100 searches/month; needs SERPAPI_KEY)
+  3. DuckDuckGo   — same site:linkedin.com/in query, no key/quota required.
+                    Used only when SerpAPI is unavailable or returns nothing,
+                    since it's a free fallback rather than a replacement.
+  4. Hunter.io    — domain email enrichment for step 2/3 hits
+                    (free 25 searches/month; needs HUNTER_API_KEY)
 
 Set API keys in a .env file (see .env.example).
 """
@@ -19,6 +22,7 @@ import urllib.parse
 from datetime import datetime
 
 import requests
+from bs4 import BeautifulSoup
 
 # ── Keys (populated by main.py via dotenv) ───────────────────────────────────
 APOLLO_API_KEY  = os.getenv("APOLLO_API_KEY",  "")
@@ -53,13 +57,25 @@ def find_columbia_alumni(company_name: str, website: str, sector: str,
     time.sleep(delay)
 
     # Method 2 ── SerpAPI → LinkedIn profiles
-    serp_people, s_status = _serp_search(company_name)
-    _log("SerpAPI", len(serp_people or []), s_status)
+    web_people, web_source = None, ""
+    if SERPAPI_KEY:
+        web_people, s_status = _serp_search(company_name)
+        _log("SerpAPI", len(web_people or []), s_status)
+        web_source = "serpapi"
 
-    if not serp_people:
+    # Method 3 ── DuckDuckGo fallback (free, no key) if SerpAPI is unavailable
+    # or came back empty. Same LinkedIn-URL-match precision as SerpAPI, so
+    # this adds coverage without adding noise.
+    if not web_people:
+        time.sleep(delay)
+        web_people, d_status = _ddg_search(company_name)
+        _log("DuckDuckGo", len(web_people or []), d_status)
+        web_source = "duckduckgo"
+
+    if not web_people:
         return []
 
-    # Method 3 ── Hunter.io email enrichment for SerpAPI hits
+    # Method 4 ── Hunter.io email enrichment for step 2/3 hits
     email_map: dict = {}
     if HUNTER_API_KEY and website:
         time.sleep(delay)
@@ -69,11 +85,11 @@ def find_columbia_alumni(company_name: str, website: str, sector: str,
             email_map = _build_email_map(emails)
 
     results = []
-    for person in serp_people:
+    for person in web_people:
         if email_map:
             person["email"] = _match_email(person["name"], email_map)
         results.append(_normalise(person, company_name, sector,
-                                  "serp+hunter" if email_map else "serp"))
+                                  f"{web_source}+hunter" if email_map else web_source))
     return results
 
 
@@ -171,7 +187,62 @@ def _serp_search(company_name: str) -> tuple:
     return people, "ok"
 
 
-# ── Method 3: Hunter.io email enrichment ─────────────────────────────────────
+# ── Method 3: DuckDuckGo → LinkedIn (free fallback) ──────────────────────────
+
+def _ddg_search(company_name: str) -> tuple:
+    query = f'site:linkedin.com/in "Columbia University" "{company_name}"'
+    try:
+        r = requests.post(
+            "https://html.duckduckgo.com/html/",
+            data={"q": query},
+            headers={"User-Agent": "Mozilla/5.0 (compatible; ColumbiaAlumniFinder/1.0)"},
+            timeout=25,
+        )
+    except requests.RequestException as exc:
+        return None, f"network_error: {exc}"
+
+    if r.status_code == 429:
+        return None, "rate_limited"
+    if r.status_code != 200:
+        return None, f"http_{r.status_code}"
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    people = []
+    for result in soup.select(".result__a"):
+        raw_href = result.get("href", "")
+        link     = _resolve_ddg_redirect(raw_href)
+        title    = result.get_text(strip=True)
+
+        li_url = _extract_linkedin_url(link)
+        if not li_url:
+            continue
+
+        snippet_el = result.find_parent(class_="result").select_one(".result__snippet") \
+            if result.find_parent(class_="result") else None
+        snippet = snippet_el.get_text(strip=True) if snippet_el else ""
+
+        people.append({
+            "name":            _name_from_title(title),
+            "title":           _job_from_snippet(snippet),
+            "email":           "",
+            "linkedin_url":    li_url,
+            "location":        "",
+            "graduation_year": "",
+            "degree":          "",
+        })
+    return people, "ok"
+
+
+def _resolve_ddg_redirect(href: str) -> str:
+    """DuckDuckGo HTML results wrap links as /l/?uddg=<encoded-url>&..."""
+    if "uddg=" not in href:
+        return href
+    parsed = urllib.parse.urlparse(href)
+    qs = urllib.parse.parse_qs(parsed.query)
+    return urllib.parse.unquote(qs.get("uddg", [""])[0])
+
+
+# ── Method 4: Hunter.io email enrichment ─────────────────────────────────────
 
 def _hunter_domain(website: str) -> tuple:
     domain = _extract_domain(website)
